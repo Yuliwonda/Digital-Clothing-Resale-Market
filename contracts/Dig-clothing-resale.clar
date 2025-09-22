@@ -16,11 +16,18 @@
 (define-constant ERR-INVALID-CONDITION (err u109))
 (define-constant ERR-DISCOUNT-EXISTS (err u110))
 (define-constant ERR-INVALID-DISCOUNT (err u111))
+(define-constant ERR-AUCTION-NOT-FOUND (err u112))
+(define-constant ERR-AUCTION-ENDED (err u113))
+(define-constant ERR-BID-TOO-LOW (err u114))
+(define-constant ERR-CANNOT-BID-OWN-AUCTION (err u115))
+(define-constant ERR-AUCTION-ACTIVE (err u116))
 
 (define-data-var next-listing-id uint u1)
 (define-data-var platform-fee uint u250)
 (define-data-var contract-paused bool false)
 (define-data-var trade-lock-duration uint u144)
+(define-data-var next-auction-id uint u1)
+(define-data-var min-bid-increment uint u1000000)
 
 (define-map clothing-listings
   { listing-id: uint }
@@ -89,6 +96,23 @@
 (define-map user-discount-usage
   { user: principal, listing-id: uint }
   { used: bool, timestamp: uint })
+
+(define-map auctions
+  { auction-id: uint }
+  {
+    seller: principal,
+    listing-id: uint,
+    starting-price: uint,
+    current-bid: uint,
+    highest-bidder: (optional principal),
+    end-block: uint,
+    active: bool,
+    created-at: uint
+  })
+
+(define-map auction-bids
+  { auction-id: uint, bidder: principal }
+  { bid-amount: uint, timestamp: uint })
 
 (define-public (initialize-platform (platform (string-ascii 32)) (fee-rate uint))
   (begin
@@ -250,6 +274,131 @@
         (merge discount-data { active: false }))
       (ok true))))
 
+(define-public (create-auction
+  (listing-id uint)
+  (starting-price uint)
+  (duration uint))
+  (let ((listing (unwrap! (map-get? clothing-listings { listing-id: listing-id }) ERR-NOT-FOUND))
+        (auction-id (var-get next-auction-id)))
+    (begin
+      (asserts! (not (var-get contract-paused)) ERR-TRADE-LOCKED)
+      (asserts! (is-eq tx-sender (get seller listing)) ERR-UNAUTHORIZED)
+      (asserts! (get active listing) ERR-NOT-FOUND)
+      (asserts! (> starting-price u0) ERR-INVALID-PRICE)
+      (asserts! (> duration u0) ERR-AUCTION-ENDED)
+      
+      (map-set auctions
+        { auction-id: auction-id }
+        {
+          seller: tx-sender,
+          listing-id: listing-id,
+          starting-price: starting-price,
+          current-bid: starting-price,
+          highest-bidder: none,
+          end-block: (+ stacks-block-height duration),
+          active: true,
+          created-at: stacks-block-height
+        })
+      
+      (var-set next-auction-id (+ auction-id u1))
+      (ok auction-id))))
+
+(define-public (place-bid (auction-id uint) (bid-amount uint))
+  (let ((auction (unwrap! (map-get? auctions { auction-id: auction-id }) ERR-AUCTION-NOT-FOUND)))
+    (begin
+      (asserts! (not (var-get contract-paused)) ERR-TRADE-LOCKED)
+      (asserts! (get active auction) ERR-AUCTION-ENDED)
+      (asserts! (< stacks-block-height (get end-block auction)) ERR-AUCTION-ENDED)
+      (asserts! (not (is-eq tx-sender (get seller auction))) ERR-CANNOT-BID-OWN-AUCTION)
+      (asserts! (>= bid-amount (+ (get current-bid auction) (var-get min-bid-increment))) ERR-BID-TOO-LOW)
+      
+      (let ((previous-bidder (get highest-bidder auction))
+            (previous-bid (get current-bid auction)))
+        
+        (match previous-bidder
+          prev-bidder (try! (as-contract (stx-transfer? previous-bid tx-sender prev-bidder)))
+          true)
+        
+        (try! (stx-transfer? bid-amount tx-sender (as-contract tx-sender)))
+        
+        (map-set auctions
+          { auction-id: auction-id }
+          (merge auction {
+            current-bid: bid-amount,
+            highest-bidder: (some tx-sender)
+          }))
+        
+        (map-set auction-bids
+          { auction-id: auction-id, bidder: tx-sender }
+          {
+            bid-amount: bid-amount,
+            timestamp: stacks-block-height
+          })
+        
+        (ok true)))))
+
+(define-public (finalize-auction (auction-id uint))
+  (let ((auction (unwrap! (map-get? auctions { auction-id: auction-id }) ERR-AUCTION-NOT-FOUND))
+        (listing (unwrap! (map-get? clothing-listings { listing-id: (get listing-id auction) }) ERR-NOT-FOUND)))
+    (begin
+      (asserts! (get active auction) ERR-AUCTION-ENDED)
+      (asserts! (>= stacks-block-height (get end-block auction)) ERR-AUCTION-ACTIVE)
+      
+      (match (get highest-bidder auction)
+        winner
+        (let ((final-price (get current-bid auction))
+              (platform-data (unwrap! (map-get? verified-platforms { platform: (get platform listing) }) ERR-INVALID-PLATFORM))
+              (fee-amount (/ (* final-price (get fee-rate platform-data)) u10000))
+              (seller-amount (- final-price fee-amount))
+              (trade-id (var-get next-trade-id)))
+          
+          (try! (as-contract (stx-transfer? seller-amount tx-sender (get seller auction))))
+          (try! (as-contract (stx-transfer? fee-amount tx-sender CONTRACT-OWNER)))
+          
+          (map-set auctions
+            { auction-id: auction-id }
+            (merge auction { active: false }))
+          
+          (map-set clothing-listings
+            { listing-id: (get listing-id auction) }
+            (merge listing { active: false }))
+          
+          (map-set trade-history
+            { trade-id: trade-id }
+            {
+              listing-id: (get listing-id auction),
+              seller: (get seller auction),
+              buyer: winner,
+              price: final-price,
+              platform: (get platform listing),
+              timestamp: stacks-block-height
+            })
+          
+          (update-user-stats (get seller auction) true final-price)
+          (update-user-stats winner false final-price)
+          (update-platform-stats (get platform listing) final-price)
+          
+          (var-set next-trade-id (+ trade-id u1))
+          (ok trade-id))
+        
+        (begin
+          (map-set auctions
+            { auction-id: auction-id }
+            (merge auction { active: false }))
+          (ok u0))))))
+
+(define-public (cancel-auction (auction-id uint))
+  (let ((auction (unwrap! (map-get? auctions { auction-id: auction-id }) ERR-AUCTION-NOT-FOUND)))
+    (begin
+      (asserts! (is-eq tx-sender (get seller auction)) ERR-UNAUTHORIZED)
+      (asserts! (get active auction) ERR-AUCTION-ENDED)
+      (asserts! (is-none (get highest-bidder auction)) ERR-AUCTION-ACTIVE)
+      
+      (map-set auctions
+        { auction-id: auction-id }
+        (merge auction { active: false }))
+      (ok true))))
+
 (define-public (purchase-clothing (listing-id uint))
   (let ((listing (unwrap! (map-get? clothing-listings { listing-id: listing-id }) ERR-NOT-FOUND)))
     (begin
@@ -354,6 +503,8 @@
     platform-fee: (var-get platform-fee),
     contract-paused: (var-get contract-paused),
     trade-lock-duration: (var-get trade-lock-duration),
+    next-auction-id: (var-get next-auction-id),
+    min-bid-increment: (var-get min-bid-increment),
     owner: CONTRACT-OWNER
   })
 
@@ -379,6 +530,27 @@
         user-not-used: (is-none usage-data)
       }
       { has-campaign: false, is-active: false, not-expired: false, under-usage-limit: false, user-not-used: false })))
+
+(define-read-only (get-auction (auction-id uint))
+  (map-get? auctions { auction-id: auction-id }))
+
+(define-read-only (get-auction-bid (auction-id uint) (bidder principal))
+  (map-get? auction-bids { auction-id: auction-id, bidder: bidder }))
+
+(define-read-only (get-auction-status (auction-id uint))
+  (match (map-get? auctions { auction-id: auction-id })
+    auction
+    {
+      exists: true,
+      active: (get active auction),
+      ended: (>= stacks-block-height (get end-block auction)),
+      time-remaining: (if (>= stacks-block-height (get end-block auction)) 
+                       u0 
+                       (- (get end-block auction) stacks-block-height)),
+      current-bid: (get current-bid auction),
+      has-bidder: (is-some (get highest-bidder auction))
+    }
+    { exists: false, active: false, ended: true, time-remaining: u0, current-bid: u0, has-bidder: false }))
 
 (define-private (get-discounted-price (listing-id uint) (original-price uint) (discount-data (optional {discount-type: (string-ascii 16), discount-rate: uint, min-blocks-old: uint, expires-at: uint, max-uses: uint, used-count: uint, active: bool})))
   (match discount-data
