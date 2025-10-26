@@ -21,6 +21,9 @@
 (define-constant ERR-BID-TOO-LOW (err u114))
 (define-constant ERR-CANNOT-BID-OWN-AUCTION (err u115))
 (define-constant ERR-AUCTION-ACTIVE (err u116))
+(define-constant ERR-WISHLIST-LIMIT-REACHED (err u117))
+(define-constant ERR-NOT-IN-WISHLIST (err u118))
+(define-constant ERR-ALREADY-IN-WISHLIST (err u119))
 
 (define-data-var next-listing-id uint u1)
 (define-data-var platform-fee uint u250)
@@ -28,6 +31,7 @@
 (define-data-var trade-lock-duration uint u144)
 (define-data-var next-auction-id uint u1)
 (define-data-var min-bid-increment uint u1000000)
+(define-data-var max-wishlist-items uint u50)
 
 (define-map clothing-listings
   { listing-id: uint }
@@ -113,6 +117,14 @@
 (define-map auction-bids
   { auction-id: uint, bidder: principal }
   { bid-amount: uint, timestamp: uint })
+
+(define-map user-wishlist
+  { user: principal, listing-id: uint }
+  { added-at: uint, notify-price-drop: bool })
+
+(define-map wishlist-count
+  { user: principal }
+  { count: uint })
 
 (define-public (initialize-platform (platform (string-ascii 32)) (fee-rate uint))
   (begin
@@ -480,6 +492,45 @@
     (var-set contract-paused false)
     (ok true)))
 
+(define-public (add-to-wishlist (listing-id uint) (notify-price-drop bool))
+  (let ((listing (unwrap! (map-get? clothing-listings { listing-id: listing-id }) ERR-NOT-FOUND))
+        (current-count (default-to { count: u0 } (map-get? wishlist-count { user: tx-sender }))))
+    (begin
+      (asserts! (get active listing) ERR-NOT-FOUND)
+      (asserts! (is-none (map-get? user-wishlist { user: tx-sender, listing-id: listing-id })) ERR-ALREADY-IN-WISHLIST)
+      (asserts! (< (get count current-count) (var-get max-wishlist-items)) ERR-WISHLIST-LIMIT-REACHED)
+      
+      (map-set user-wishlist
+        { user: tx-sender, listing-id: listing-id }
+        { added-at: stacks-block-height, notify-price-drop: notify-price-drop })
+      
+      (map-set wishlist-count
+        { user: tx-sender }
+        { count: (+ (get count current-count) u1) })
+      
+      (ok true))))
+
+(define-public (remove-from-wishlist (listing-id uint))
+  (let ((wishlist-item (unwrap! (map-get? user-wishlist { user: tx-sender, listing-id: listing-id }) ERR-NOT-IN-WISHLIST))
+        (current-count (unwrap! (map-get? wishlist-count { user: tx-sender }) ERR-NOT-IN-WISHLIST)))
+    (begin
+      (map-delete user-wishlist { user: tx-sender, listing-id: listing-id })
+      
+      (map-set wishlist-count
+        { user: tx-sender }
+        { count: (- (get count current-count) u1) })
+      
+      (ok true))))
+
+(define-public (toggle-price-notification (listing-id uint))
+  (let ((wishlist-item (unwrap! (map-get? user-wishlist { user: tx-sender, listing-id: listing-id }) ERR-NOT-IN-WISHLIST)))
+    (begin
+      (map-set user-wishlist
+        { user: tx-sender, listing-id: listing-id }
+        (merge wishlist-item { notify-price-drop: (not (get notify-price-drop wishlist-item)) }))
+      
+      (ok true))))
+
 (define-read-only (get-listing (listing-id uint))
   (map-get? clothing-listings { listing-id: listing-id }))
 
@@ -505,6 +556,7 @@
     trade-lock-duration: (var-get trade-lock-duration),
     next-auction-id: (var-get next-auction-id),
     min-bid-increment: (var-get min-bid-increment),
+    max-wishlist-items: (var-get max-wishlist-items),
     owner: CONTRACT-OWNER
   })
 
@@ -551,6 +603,15 @@
       has-bidder: (is-some (get highest-bidder auction))
     }
     { exists: false, active: false, ended: true, time-remaining: u0, current-bid: u0, has-bidder: false }))
+
+(define-read-only (get-wishlist-item (user principal) (listing-id uint))
+  (map-get? user-wishlist { user: user, listing-id: listing-id }))
+
+(define-read-only (get-wishlist-count (user principal))
+  (default-to { count: u0 } (map-get? wishlist-count { user: user })))
+
+(define-read-only (is-in-wishlist (user principal) (listing-id uint))
+  (is-some (map-get? user-wishlist { user: user, listing-id: listing-id })))
 
 (define-private (get-discounted-price (listing-id uint) (original-price uint) (discount-data (optional {discount-type: (string-ascii 16), discount-rate: uint, min-blocks-old: uint, expires-at: uint, max-uses: uint, used-count: uint, active: bool})))
   (match discount-data
