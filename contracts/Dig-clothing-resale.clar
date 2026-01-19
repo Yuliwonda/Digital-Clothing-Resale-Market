@@ -24,6 +24,10 @@
 (define-constant ERR-WISHLIST-LIMIT-REACHED (err u117))
 (define-constant ERR-NOT-IN-WISHLIST (err u118))
 (define-constant ERR-ALREADY-IN-WISHLIST (err u119))
+(define-constant ERR-REVIEW-EXISTS (err u120))
+(define-constant ERR-NO-PURCHASE (err u121))
+(define-constant ERR-INVALID-RATING (err u122))
+(define-constant ERR-REVIEW-PERIOD-EXPIRED (err u123))
 
 (define-data-var next-listing-id uint u1)
 (define-data-var platform-fee uint u250)
@@ -32,6 +36,8 @@
 (define-data-var next-auction-id uint u1)
 (define-data-var min-bid-increment uint u1000000)
 (define-data-var max-wishlist-items uint u50)
+(define-data-var review-period-blocks uint u4320)
+(define-data-var next-review-id uint u1)
 
 (define-map clothing-listings
   { listing-id: uint }
@@ -125,6 +131,30 @@
 (define-map wishlist-count
   { user: principal }
   { count: uint })
+
+(define-map seller-reviews
+  { review-id: uint }
+  {
+    trade-id: uint,
+    reviewer: principal,
+    seller: principal,
+    rating: uint,
+    review-text: (string-utf8 256),
+    created-at: uint
+  })
+
+(define-map seller-ratings
+  { seller: principal }
+  {
+    total-ratings: uint,
+    rating-sum: uint,
+    five-star-count: uint,
+    one-star-count: uint
+  })
+
+(define-map trade-reviewed
+  { trade-id: uint }
+  { reviewed: bool })
 
 (define-public (initialize-platform (platform (string-ascii 32)) (fee-rate uint))
   (begin
@@ -531,6 +561,51 @@
       
       (ok true))))
 
+(define-public (submit-review (trade-id uint) (rating uint) (review-text (string-utf8 256)))
+  (let ((trade (unwrap! (map-get? trade-history { trade-id: trade-id }) ERR-NOT-FOUND))
+        (review-id (var-get next-review-id)))
+    (begin
+      (asserts! (not (var-get contract-paused)) ERR-TRADE-LOCKED)
+      (asserts! (is-eq tx-sender (get buyer trade)) ERR-UNAUTHORIZED)
+      (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+      (asserts! (<= stacks-block-height (+ (get timestamp trade) (var-get review-period-blocks))) ERR-REVIEW-PERIOD-EXPIRED)
+      (asserts! (is-none (map-get? trade-reviewed { trade-id: trade-id })) ERR-REVIEW-EXISTS)
+      
+      (map-set seller-reviews
+        { review-id: review-id }
+        {
+          trade-id: trade-id,
+          reviewer: tx-sender,
+          seller: (get seller trade),
+          rating: rating,
+          review-text: review-text,
+          created-at: stacks-block-height
+        })
+      
+      (map-set trade-reviewed { trade-id: trade-id } { reviewed: true })
+      
+      (let ((current-ratings (default-to 
+              { total-ratings: u0, rating-sum: u0, five-star-count: u0, one-star-count: u0 }
+              (map-get? seller-ratings { seller: (get seller trade) }))))
+        (map-set seller-ratings
+          { seller: (get seller trade) }
+          {
+            total-ratings: (+ (get total-ratings current-ratings) u1),
+            rating-sum: (+ (get rating-sum current-ratings) rating),
+            five-star-count: (if (is-eq rating u5) (+ (get five-star-count current-ratings) u1) (get five-star-count current-ratings)),
+            one-star-count: (if (is-eq rating u1) (+ (get one-star-count current-ratings) u1) (get one-star-count current-ratings))
+          }))
+      
+      (var-set next-review-id (+ review-id u1))
+      (ok review-id))))
+
+(define-public (set-review-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (asserts! (> new-period u0) ERR-INVALID-PRICE)
+    (var-set review-period-blocks new-period)
+    (ok true)))
+
 (define-read-only (get-listing (listing-id uint))
   (map-get? clothing-listings { listing-id: listing-id }))
 
@@ -612,6 +687,35 @@
 
 (define-read-only (is-in-wishlist (user principal) (listing-id uint))
   (is-some (map-get? user-wishlist { user: user, listing-id: listing-id })))
+
+(define-read-only (get-review (review-id uint))
+  (map-get? seller-reviews { review-id: review-id }))
+
+(define-read-only (get-seller-rating (seller principal))
+  (match (map-get? seller-ratings { seller: seller })
+    rating-data
+    {
+      total-ratings: (get total-ratings rating-data),
+      average-rating: (if (> (get total-ratings rating-data) u0)
+                        (/ (* (get rating-sum rating-data) u100) (get total-ratings rating-data))
+                        u0),
+      five-star-count: (get five-star-count rating-data),
+      one-star-count: (get one-star-count rating-data)
+    }
+    { total-ratings: u0, average-rating: u0, five-star-count: u0, one-star-count: u0 }))
+
+(define-read-only (is-trade-reviewed (trade-id uint))
+  (is-some (map-get? trade-reviewed { trade-id: trade-id })))
+
+(define-read-only (can-submit-review (trade-id uint) (user principal))
+  (match (map-get? trade-history { trade-id: trade-id })
+    trade
+    {
+      is-buyer: (is-eq user (get buyer trade)),
+      not-reviewed: (is-none (map-get? trade-reviewed { trade-id: trade-id })),
+      within-period: (<= stacks-block-height (+ (get timestamp trade) (var-get review-period-blocks)))
+    }
+    { is-buyer: false, not-reviewed: false, within-period: false }))
 
 (define-private (get-discounted-price (listing-id uint) (original-price uint) (discount-data (optional {discount-type: (string-ascii 16), discount-rate: uint, min-blocks-old: uint, expires-at: uint, max-uses: uint, used-count: uint, active: bool})))
   (match discount-data
